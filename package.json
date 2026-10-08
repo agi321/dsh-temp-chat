@@ -4,7 +4,10 @@
   "type": "module",
   "description": "临时问答：/single-turn 与 /multi-turn 用独立子代理联网检索作答，结果只留在当前对话，不进入主模型上下文。",
   "license": "MIT",
-  "author": "agi321.cc",
+  "author": {
+    "name": "agi321.cc",
+    "url": "https://github.com/agi321/dsh-temp-chat"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/agi321/dsh-temp-chat.git"
