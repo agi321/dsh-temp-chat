@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Temp Chat (temporary questions)",
+    "description": "Ask /single-turn for a one-shot answer and /multi-turn to continue the same temporary thread. Answers come from an isolated subagent with web search, are shown in this conversation, and never enter the main model context."
+  }
+}

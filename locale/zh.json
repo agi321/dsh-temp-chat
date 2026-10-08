@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "临时问答（Temp Chat）",
+    "description": "用 /single-turn 单轮提问、用 /multi-turn 续接同一个临时话题。答案由独立子代理联网检索后给出，显示在当前对话里，且永不进入主模型上下文。"
+  }
+}

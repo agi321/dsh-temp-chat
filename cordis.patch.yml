@@ -1,0 +1,7 @@
+# dsh-temp-chat：临时问答的命令行入口。
+#
+# 只插入一行。所有可调项都有内置默认值（见 README「配置」一节），
+# 需要调整时给这一行加 config:（例如 allowTools / maxTurns / timeoutMs）。
+- insert:
+    - id: dsh-temp-chat
+      name: '@agi321/dsh-temp-chat'
