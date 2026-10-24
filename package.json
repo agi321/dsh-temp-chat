@@ -1,6 +1,6 @@
 {
   "name": "@agi321/dsh-temp-chat",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "临时问答：/single-turn 与 /multi-turn 用独立子代理联网检索作答，结果只留在当前对话，不进入主模型上下文。",
   "license": "MIT",
@@ -64,7 +64,7 @@
   },
   "engines": {
     "node": ">=24",
-    "dsh": ">=0.2.0-rc.2"
+    "dsh": ">=0.2.1-rc.2"
   },
   "scripts": {
     "test": "node --test \"test/**/*.test.mjs\"",

@@ -1,11 +1,11 @@
 /**
  * 宿主半边的测试：用假 ctx 驱动真实注册出来的命令处理器。
- * 覆盖上下文隔离、历史重放、工具白名单、超时/失败/取消等分支。
+ * 覆盖上下文隔离、历史重放、preset 组合（角色 + 工具白名单）、超时/失败/取消等分支。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { DEFAULT_CONFIG, apply } from '../index.js';
+import { DEFAULT_CONFIG, PRESET_ID, apply } from '../index.js';
 import { MULTI_TURN, SINGLE_TURN } from '../lib/thread.js';
 
 const COMPLETED = {
@@ -17,15 +17,19 @@ const COMPLETED = {
   ],
 };
 
+/** 取 preset 定义里某个 id 的行。 */
+const row = (definition, id) => definition.plugins.find((plugin) => plugin.id === id);
+
 /**
  * 造一个够用的宿主 ctx。
  *
  * @param {object} [options] - 桩行为开关。
- * @returns {{ctx: any, registered: Map<string, any>, runs: any[], agent: any}} 测试夹具。
+ * @returns {{ctx: any, registered: Map<string, any>, runs: any[], presets: any[], agent: any}} 测试夹具。
  */
 function createFixture(options = {}) {
   const registered = new Map();
   const runs = [];
+  const presets = [];
   const sessionEvents = options.sessionEvents ?? [];
   const providerName = options.providerName ?? DEFAULT_CONFIG.provider;
   const queryFails = options.queryFails === true;
@@ -52,12 +56,16 @@ function createFixture(options = {}) {
       },
     },
     subagents: {
-      getProvider: (name) => (name === providerName ? { name } : undefined),
+      getProvider: (name) => (name === providerName
+        ? { name, ...(options.providerCaps === undefined ? {} : { capabilities: options.providerCaps }) }
+        : undefined),
       list: () => [providerName],
-      start: async (name, request) => {
-        runs.push({ name, request });
+      // 0.2.1-rc.2 起的权威入口：startActivation(spec)，spec = { provider, label, request, signal, delivery }。
+      startActivation: async (spec) => {
+        runs.push(spec);
         if (options.startThrows !== undefined) throw options.startThrows;
         return {
+          childId: 'child-1',
           result: Promise.resolve(options.result ?? COMPLETED),
           dispose: async () => {
             if (options.disposeThrows === true) throw new Error('dispose failed');
@@ -66,6 +74,18 @@ function createFixture(options = {}) {
       },
     },
     get: (key) => {
+      if (key === 'agentPresets') {
+        return {
+          register: async (definition) => {
+            presets.push(definition);
+            if (options.registerThrows !== undefined) throw options.registerThrows;
+            return async () => {
+              const index = presets.indexOf(definition);
+              if (index >= 0) presets.splice(index, 1);
+            };
+          },
+        };
+      }
       if (key !== 'sessionQuery') return undefined;
       if (options.noQuery === true) return undefined;
       return {
@@ -77,7 +97,7 @@ function createFixture(options = {}) {
     },
   };
 
-  return { ctx, registered, runs, agent };
+  return { ctx, registered, runs, presets, agent };
 }
 
 /** 注册插件并取回某个命令的 handler。 */
@@ -150,23 +170,57 @@ test('every registered command describes itself without mentioning a short alias
   }
 });
 
-test('/single-turn runs one spawn child with an isolated prompt and a read-only tool allowlist', async () => {
-  const { registered, runs, agent } = setup();
+test('/single-turn runs one activation against the internal preset with an isolated prompt', async () => {
+  const { registered, runs, presets, agent } = setup();
   const result = await invoke(registered.get(SINGLE_TURN).handler, '  今天天气如何？  ', { agent });
 
   assert.equal(result.kind, 'success');
   assert.equal(result.text, '答案：今天晴。', '结果就是模型的回答，不带任何过程信息');
   assert.doesNotMatch(result.text, /检索过程|工具调用|web_search/);
   assert.equal(runs.length, 1);
-  const { name, request } = runs[0];
-  assert.equal(name, DEFAULT_CONFIG.provider);
-  assert.deepEqual(request.toolFilter, { allow: [...DEFAULT_CONFIG.allowTools] });
-  assert.equal(request.maxDepth, 1, '子代理自身 depth 为 1；给 0 会直接抛 SubagentDepthError');
-  assert.equal(request.parent, agent);
-  assert.match(request.persona, /联网检索助手/);
-  assert.ok(request.signal instanceof AbortSignal, '必须交出取消信号');
-  assert.match(request.prompt[0].text, /今天天气如何？/);
-  assert.doesNotMatch(request.prompt[0].text, /此前的临时话题/, '单轮模式不得带历史');
+  const spec = runs[0];
+  assert.equal(spec.provider, DEFAULT_CONFIG.provider);
+  assert.equal(spec.delivery, 'caller', '结果只交给调用方，不能往父会话追加完成通告');
+  assert.equal(spec.request.agentPreset, PRESET_ID, '角色与工具范围由 preset 组合决定');
+  assert.equal(spec.request.persona, undefined, '旧 persona 字段已随 start() 一起移除');
+  assert.equal(spec.request.toolFilter, undefined, '旧 toolFilter 字段已随 start() 一起移除');
+  assert.equal(spec.request.maxDepth, 1, '子代理自身 depth 为 1；给 0 会直接抛 SubagentDepthError');
+  assert.equal(spec.request.parent, agent);
+  assert.ok(spec.signal instanceof AbortSignal, '必须交出取消信号');
+  assert.match(spec.request.prompt[0].text, /今天天气如何？/);
+  assert.doesNotMatch(spec.request.prompt[0].text, /此前的临时话题/, '单轮模式不得带历史');
+
+  // persona 与白名单应体现在注册的 preset 定义里。
+  assert.equal(presets.length, 1, '每次 apply 只注册一个 preset');
+  const definition = presets[0];
+  assert.equal(definition.id, PRESET_ID);
+  assert.match(row(definition, 'persona').config.prefix, /联网检索助手/);
+  assert.deepEqual(row(definition, 'tool-web').config, { search: true, fetch: true, searchTimeoutMs: 60000 });
+  assert.deepEqual(row(definition, 'tool-fs').config, { read: true, readImage: false, write: false, edit: false });
+  assert.ok(row(definition, 'tool-fs-search') !== undefined, 'glob/grep 走 dsh-tool-fs-search 行');
+  assert.ok(row(definition, 'compaction') !== undefined, '长检索会话要保留压缩行');
+});
+
+test('a custom persona from config lands in the preset row', async () => {
+  const { presets } = setup({}, { persona: '你是定制角色。' });
+  assert.equal(row(presets[0], 'persona').config.prefix, '你是定制角色。');
+});
+
+test('a provider without agentPreset support is refused with a clear hint', async () => {
+  const { registered, runs, agent } = setup({ providerCaps: { agentPreset: false, depthLimit: true } });
+  const result = await invoke(registered.get(SINGLE_TURN).handler, '问题', { agent });
+  assert.equal(result.kind, 'error');
+  assert.match(result.text, /不支持 agentPreset/);
+  assert.match(result.text, /spawn/);
+  assert.equal(runs.length, 0);
+});
+
+test('a failing preset registration surfaces as a command error and retries next time', async () => {
+  const { registered, runs, agent } = setup({ registerThrows: new Error('preset boom') });
+  const result = await invoke(registered.get(SINGLE_TURN).handler, '问题', { agent });
+  assert.equal(result.kind, 'error');
+  assert.match(result.text, /preset boom/);
+  assert.equal(runs.length, 0, 'preset 没注册成功就不该起子代理');
 });
 
 test('/single-turn ignores an existing thread and starts a fresh topic', async () => {
@@ -182,7 +236,7 @@ test('/single-turn ignores an existing thread and starts a fresh topic', async (
   const prompt = runs[0].request.prompt[0].text;
   assert.match(prompt, /另起一问/);
   assert.doesNotMatch(prompt, /第一个答案/, '单轮模式不重放历史');
-  assert.match(runs[0].request.label, /单轮/);
+  assert.match(runs[0].label, /单轮/);
 });
 
 test('/multi-turn replays the current thread from the session log', async () => {
@@ -218,7 +272,7 @@ test('/multi-turn continues the thread started by /single-turn', async () => {
   const prompt = runs[0].request.prompt[0].text;
   assert.match(prompt, /用户：第一问/);
   assert.match(prompt, /你的回答：第一答/);
-  assert.match(runs[0].request.label, /续问/);
+  assert.match(runs[0].label, /续问/);
 });
 
 test('a log written before the rename is ignored, so /multi-turn reports no thread', async () => {
@@ -263,14 +317,17 @@ test('config from the patch overrides the allowlist and history budget', async (
     { type: 'command/done', data: { commandId: `c${n}`, kind: 'success', text: `a${n}` } },
   ])).flat();
 
-  const { registered, runs, agent } = setup({ sessionEvents }, {
+  const { registered, runs, presets, agent } = setup({ sessionEvents }, {
     allowTools: ['web_search'],
     maxTurns: 1,
     timeoutMs: 1234,
   });
   await invoke(registered.get(MULTI_TURN).handler, 'nq', { agent });
 
-  assert.deepEqual(runs[0].request.toolFilter, { allow: ['web_search'] });
+  const definition = presets[0];
+  assert.deepEqual(row(definition, 'tool-web').config, { search: true, fetch: false, searchTimeoutMs: 60000 });
+  assert.equal(row(definition, 'tool-fs'), undefined, '不允许 fs 工具时不挂 tool-fs 行');
+  assert.equal(row(definition, 'tool-fs-search'), undefined, 'glob/grep 未被允许就不挂检索行');
   const prompt = runs[0].request.prompt[0].text;
   assert.match(prompt, /a3/);
   assert.doesNotMatch(prompt, /a2/, 'maxTurns=1 只保留最新一轮');

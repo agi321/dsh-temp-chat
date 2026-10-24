@@ -14,6 +14,14 @@
  * "结果不进入主模型上下文"。所以这里每次都是新子代理，由本插件把历史文本重放进提示词；
  * 历史事实来源是当前会话日志，因此重开对话后仍可续聊。
  *
+ * 为什么角色与工具范围走 agentPreset 组合：DSH 0.2.1-rc.2 起旧的
+ * ctx.subagents.start() 被 startActivation(spec) 取代，请求里的 persona/toolFilter
+ * 字段也一并移除——子代理的人格与模型可见工具只能来自 request.agentPreset 指向的
+ * 已注册 preset 组合（"The selected preset owns persona and tool composition"）。
+ * 因此 apply() 通过宿主 agentPresets 服务注册一个专用 preset（persona、按需挂载
+ * 的 web/fs/search 工具行、基础压缩），每次问答以 id 引用它，delivery 用 'caller'
+ * （调用方直接 await 结果，不向父会话发完成通告）。
+ *
  * @module @agi321/dsh-temp-chat
  */
 import {
@@ -72,6 +80,126 @@ const PERSONA = [
   '回答要简洁、可核对，用与提问相同的语言。',
 ].join('\n');
 
+/** 本插件注册的专用 preset id；request.agentPreset 用它定位组合。 */
+export const PRESET_ID = 'dsh-temp-chat';
+
+/**
+ * allowTools 里能真正映射到 preset 行的工具名。
+ * glob 与 grep 同属 dsh-tool-fs-search，无法拆开挂载（挂载即两个都有）。
+ * 名单里出现其它工具名时无法经 preset 组合授予（未知工具不可见），只在日志里提醒。
+ */
+const MAPPABLE_TOOLS = Object.freeze([
+  'web_search', 'web_fetch',
+  'read', 'read_image', 'write', 'edit',
+  'glob', 'grep',
+]);
+
+/**
+ * 由 allowTools 计算 preset 行组合。
+ *
+ * 行形状完全对齐宿主标准 preset（@deepseek-ai/dsh-web-app presets/standard）：
+ * persona 行、time-context 行（"今天有什么新闻"这类问题需要当前日期）、
+ * 按需挂载的 web/fs/search 工具行（配置里的开关就是工具白名单本身）、
+ * 以及 basic 压缩组——旧行为里子代理继承宿主默认组合，压缩也在其中；
+ * 长检索会话没有压缩会撑爆上下文，所以保留。
+ * 有意不挂 agent-instructions / skill / todo 等行：旧白名单本就把它们遮掉了。
+ *
+ * @param {ResolvedConfig} settings - 已解析配置。
+ * @returns {any} PresetDefinition（@deepseek-ai/dsh-agent-preset-registry）。
+ */
+function buildPresetDefinition(settings) {
+  const want = new Set(settings.allowTools);
+  const plugins = [
+    { id: 'persona', name: '@deepseek-ai/dsh-persona', config: { prefix: settings.persona } },
+    { id: 'time-context', name: '@deepseek-ai/dsh-time-context' },
+  ];
+
+  const search = want.has('web_search');
+  const fetch = want.has('web_fetch');
+  if (search || fetch) {
+    plugins.push({
+      id: 'tool-web',
+      name: '@deepseek-ai/dsh-tool-web',
+      // searchTimeoutMs 对齐宿主默认行的 60s（DeepSeek 检索是一次完整辅助模型请求）。
+      config: { search, fetch, searchTimeoutMs: 60000 },
+    });
+  }
+
+  const fsConfig = {
+    read: want.has('read'),
+    readImage: want.has('read_image'),
+    write: want.has('write'),
+    edit: want.has('edit'),
+  };
+  if (Object.values(fsConfig).some(Boolean)) {
+    plugins.push({ id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs', config: fsConfig });
+  }
+
+  if (want.has('glob') || want.has('grep')) {
+    plugins.push({
+      id: 'tool-fs-search',
+      name: '@deepseek-ai/dsh-tool-fs-search',
+      config: { sampleOverCapGlobResults: false },
+    });
+  }
+
+  plugins.push({
+    id: 'compaction',
+    name: 'cordis:group',
+    group: true,
+    isolate: { compaction: true, toolResultPruner: true },
+    config: [
+      { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic' },
+      {
+        id: 'tool-result-pruner',
+        name: '@deepseek-ai/dsh-compaction-tool-result-pruner',
+        config: { thresholdChars: 8192, headChars: 4096, tailChars: 1024 },
+      },
+    ],
+  });
+
+  return {
+    id: PRESET_ID,
+    name: '临时问答（插件内部）',
+    description: 'dsh-temp-chat 子代理专用组合，不建议给普通会话手动选择',
+    plugins,
+  };
+}
+
+/**
+ * 幂等地把 preset 注册到宿主（懒加载：agentPresets 服务在 apply 时未必就绪）。
+ *
+ * @param {any} ctx - 上下文。
+ * @param {ResolvedConfig} settings - 已解析配置。
+ * @param {{ promise: Promise<(() => Promise<void>) | null> | null }} state - 每次 apply 的注册记忆。
+ * @returns {Promise<() => Promise<void>>} 解析为注销函数；注册失败会清空记忆以便下次命令重试。
+ */
+function ensurePreset(ctx, settings, state) {
+  if (state.promise === null) {
+    const registry = ctx.get('agentPresets');
+    if (registry === undefined || typeof registry.register !== 'function') {
+      // 不落记忆：agentPresets 可能只是还没就绪，下一条命令再试。
+      return Promise.reject(new Error('宿主没有 agentPresets 服务：DSH 运行时过旧，或当前组合未包含 preset 注册表。'));
+    }
+    let attempt;
+    try {
+      attempt = registry.register(buildPresetDefinition(settings));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    state.promise = typeof attempt?.then === 'function'
+      ? attempt.then(
+          (unregister) => unregister,
+          (error) => {
+            state.promise = null;
+            throw error;
+          },
+        )
+      : Promise.resolve(typeof attempt === 'function' ? attempt : () => Promise.resolve());
+  }
+  return state.promise;
+}
+
 /* ------------------------------------------------------------------ *
  * 插件入口
  * ------------------------------------------------------------------ */
@@ -84,18 +212,44 @@ const PERSONA = [
  */
 export function apply(ctx, config) {
   const settings = resolveConfig(config);
+  /** 本 apply 周期的 preset 注册状态（null = 尚未注册或注册失败待重试）。 */
+  const presetState = { promise: null };
+
+  for (const unmapped of settings.allowTools.filter((tool) => !MAPPABLE_TOOLS.includes(tool))) {
+    ctx.logger?.warn?.(
+      `dsh-temp-chat: 工具「${unmapped}」不在 preset 可组合的行工具之列，已在子代理组合中忽略。`,
+    );
+  }
+
+  // 预热注册：agentPresets 就绪时尽早挂载，让挂载问题在日志里提前可见；
+  // 失败不致命，命令路径会重试并把错误报给用户。
+  ctx.effect(() => {
+    ensurePreset(ctx, settings, presetState).then(
+      (unregister) => { presetState.dispose = unregister; },
+      (error) => { ctx.logger?.warn?.(`dsh-temp-chat: preset 预热注册失败：${messageOf(error)}`); },
+    );
+    return () => {
+      const unregister = presetState.dispose;
+      if (unregister !== undefined) void unregister().catch(() => {});
+    };
+  });
 
   for (const command of COMMANDS) {
     ctx.effect(() => ctx.commands.register({
       name: command.name,
       description: command.description,
       input: { hint: command.hint },
-      handler: (invocation) => handleCommand(ctx, settings, command, invocation),
+      // 方案 B：长任务命令（子代理联网问答可达数分钟）。宿主打了 async 补丁时，
+      // commands/execute 在受理后立即返回，输入框草稿即时清空、Enter 不再被冻结；
+      // 真实答案稍后经 command/done 落到对话行（commandview 渲染逻辑不变）。
+      // 旧版宿主不认识该字段，会被静默忽略并退回同步行为，属向后兼容。
+      async: true,
+      handler: (invocation) => handleCommand(ctx, settings, presetState, command, invocation),
     }));
   }
 
   ctx.logger?.info?.(
-    `dsh-temp-chat ready: /${SINGLE_TURN} 单轮, /${MULTI_TURN} 续聊, provider=${settings.provider}`,
+    `dsh-temp-chat ready: /${SINGLE_TURN} 单轮, /${MULTI_TURN} 续聊, provider=${settings.provider}, preset=${PRESET_ID}`,
   );
 }
 
@@ -111,11 +265,12 @@ export function apply(ctx, config) {
  *
  * @param {any} ctx - 上下文。
  * @param {ResolvedConfig} settings - 已解析配置。
+ * @param {{ promise: Promise<(() => Promise<void>)> | null, dispose?: () => Promise<void> }} state - preset 注册状态。
  * @param {{ name: string, mode: string }} command - 被调用的命令（name 用于回显，mode 决定单轮/多轮）。
  * @param {any} invocation - 命令调用（agent、rawInput、signal）。
  * @returns {Promise<{ kind: 'success' | 'error', text: string }>} 命令结果。
  */
-async function handleCommand(ctx, settings, command, invocation) {
+async function handleCommand(ctx, settings, state, command, invocation) {
   const normalized = normalizeQuestion(invocation.rawInput);
   if (!normalized.ok) {
     return normalized.reason === 'empty'
@@ -124,7 +279,7 @@ async function handleCommand(ctx, settings, command, invocation) {
   }
 
   try {
-    return { kind: 'success', text: await answer(ctx, settings, command.mode, normalized.question, invocation) };
+    return { kind: 'success', text: await answer(ctx, settings, state, command.mode, normalized.question, invocation) };
   } catch (error) {
     if (invocation.signal?.aborted) return { kind: 'error', text: '已取消。' };
     return { kind: 'error', text: `临时问答失败：${messageOf(error)}` };
@@ -136,12 +291,13 @@ async function handleCommand(ctx, settings, command, invocation) {
  *
  * @param {any} ctx - 上下文。
  * @param {ResolvedConfig} settings - 已解析配置。
+ * @param {{ promise: Promise<(() => Promise<void>)> | null }} state - preset 注册状态。
  * @param {string} mode - 规范模式（single-turn / multi-turn）。
  * @param {string} question - 已校验的提问。
  * @param {any} invocation - 命令调用。
  * @returns {Promise<string>} 展示给用户的答案文本。
  */
-async function answer(ctx, settings, mode, question, invocation) {
+async function answer(ctx, settings, state, mode, question, invocation) {
   const agent = invocation.agent;
   if (agent === undefined) throw new Error('命令没有携带 agent，无法定位当前会话。');
 
@@ -150,6 +306,11 @@ async function answer(ctx, settings, mode, question, invocation) {
     const available = ctx.subagents.list();
     throw new Error(`子代理 provider「${settings.provider}」未注册。当前可用：${available.length > 0 ? available.join('、') : '（无）'}`);
   }
+  if (provider.capabilities !== undefined && provider.capabilities.agentPreset !== true) {
+    throw new Error(`provider「${settings.provider}」不支持 agentPreset 组合，无法套用临时问答的角色与工具范围；请把 provider 配成 spawn。`);
+  }
+
+  await ensurePreset(ctx, settings, state);
 
   let history = [];
   let missingThread = false;
@@ -161,19 +322,23 @@ async function answer(ctx, settings, mode, question, invocation) {
 
   const prompt = buildPrompt({ mode, question, history });
   const guard = createSignalGuard(invocation.signal, settings.timeoutMs);
-  let run;
+  let activation;
   try {
-    run = await ctx.subagents.start(settings.provider, {
-      parent: agent,
+    activation = await ctx.subagents.startActivation({
+      provider: settings.provider,
       label: mode === MULTI_TURN ? 'temp-chat:续问' : 'temp-chat:单轮',
-      prompt: [{ type: 'text', text: prompt }],
-      persona: PERSONA,
-      toolFilter: { allow: [...settings.allowTools] },
-      // 1 = 只允许这一层直接子代理。子代理自身的 depth 是 1，所以 maxDepth 不能给 0
-      // （resolveChildDepth 会直接抛 SubagentDepthError）；孙子代理会是 depth 2 而被拒绝，
-      // 何况白名单里本来也没有 subagent 工具。
-      maxDepth: 1,
+      request: {
+        parent: agent,
+        prompt: [{ type: 'text', text: prompt }],
+        agentPreset: PRESET_ID,
+        // 1 = 只允许这一层直接子代理。子代理自身的 depth 是 1，所以 maxDepth 不能给 0
+        // （resolveChildDepth 会直接抛 SubagentDepthError）；孙子代理会是 depth 2 而被拒绝，
+        // 何况 preset 组合里本来就没有 subagent 工具。
+        maxDepth: 1,
+      },
       signal: guard.signal,
+      // 'caller'：结果只交给调用方（本命令），不会往父会话追加模型可见的完成通告。
+      delivery: 'caller',
     });
   } catch (error) {
     guard.dispose();
@@ -183,14 +348,14 @@ async function answer(ctx, settings, mode, question, invocation) {
 
   let result;
   try {
-    result = await run.result;
+    result = await activation.result;
   } catch (error) {
     if (guard.timedOut()) throw new Error(`超时（${Math.round(settings.timeoutMs / 1000)}s）已取消，可重试或把问题拆小。`);
     throw error;
   } finally {
     guard.dispose();
     try {
-      await run.dispose();
+      await activation.dispose();
     } catch (error) {
       ctx.logger?.warn?.(`dsh-temp-chat: 子代理释放失败：${messageOf(error)}`);
     }
@@ -263,6 +428,7 @@ function resolveConfig(config) {
     : [];
   return {
     provider: stringOf(source.provider, DEFAULT_CONFIG.provider),
+    persona: stringOf(source.persona, PERSONA),
     allowTools: allowTools.length > 0 ? allowTools : [...DEFAULT_CONFIG.allowTools],
     maxTurns: countOf(source.maxTurns, DEFAULT_CONFIG.maxTurns),
     maxHistoryChars: countOf(source.maxHistoryChars, DEFAULT_CONFIG.maxHistoryChars),
@@ -344,6 +510,7 @@ function messageOf(error) {
 /**
  * @typedef {object} ResolvedConfig
  * @property {string} provider
+ * @property {string} persona - 子代理人格（preset persona 行的 prefix）。
  * @property {string[]} allowTools
  * @property {number} maxTurns
  * @property {number} maxHistoryChars

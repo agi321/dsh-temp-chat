@@ -63,10 +63,17 @@ dsh plugin --profile web add github:agi321/dsh-temp-chat
 
 **要求与注意**
 
-- DSH `0.2.0-rc.2` 或更高（本插件在该版本上实测）。`package.json` 的 `engines.dsh` 就是这个范围；
-  它是**声明性**元数据——DSH 当前的安装器与加载器并不校验它，声明了也不会因此拒绝不兼容的宿主。
+- DSH `0.2.1-rc.2` 或更高（本插件在该版本上实测）。0.2.1-rc.2 起子代理服务把旧的
+  `ctx.subagents.start()` 换成了 `startActivation(spec)`，请求里的 `persona`/`toolFilter`
+  字段也被移除，改由 `request.agentPreset` 指向的 preset 组合决定；本插件已跟进。
+  `package.json` 的 `engines.dsh` 就是这个范围；它是**声明性**元数据——DSH 当前的安装器与
+  加载器并不校验它，声明了也不会因此拒绝不兼容的宿主。若在旧宿主上跑本版插件，会报
+  `ctx.subagents.startActivation is not a function`。
 - Node 24 或更高。DSH `0.2.0-rc.2` 自带的运行时就是 Node 24.x（本插件在 Node 24.21 下实测通过）。
-- 子代理默认只带 `web_search`、`web_fetch`、`read`、`glob`、`grep` 五个工具。**当前 preset 里没有白名单中的工具名时**，`tools.restrict()` 会抛错，错误会原样显示在命令结果里——把 `allowTools` 改成该 preset 真实拥有的工具即可。
+- 子代理默认只带 `web_search`、`web_fetch`、`read`、`glob`、`grep` 五个工具。白名单不再靠
+  `tools.restrict()` 遮罩，而是直接决定插件注册的内部 preset（`dsh-temp-chat`）挂载哪些工具行：
+  `glob` 与 `grep` 同属 `@deepseek-ai/dsh-tool-fs-search` 一行，拆不开——允许其一即两个都开；
+  映射不到工具行的名字会被忽略并在日志里告警。
 - 改动宿主半边（`index.js` / `lib/`）后需要重启 dsh：已加载的宿主模块不会热替换。客户端半边（`client.js`）的改动刷新页面即可。
 
 ## 为什么这样设计
@@ -74,8 +81,8 @@ dsh plugin --profile web add github:agi321/dsh-temp-chat
 | 要求 | 机制 |
 | --- | --- |
 | 结果只显示、不污染主上下文 | 斜杠命令的 `command/run` + `command/done` 是 log-only 事件：UI 会渲染，模型请求永不包含 |
-| 只带本次问题、上下文隔离 | `ctx.subagents.start('spawn', …)`；spawn provider 的 `inheritsParentContext === false`，子代理是全新 session |
-| 联网检索、不跑本地命令 | 子代理 `toolFilter.allow = [web_search, web_fetch, read, glob, grep]`，且白名单里没有 `subagent`，它无法再派生子代理（`maxDepth: 1` 只放行这一层直接子代理） |
+| 只带本次问题、上下文隔离 | `ctx.subagents.startActivation({ provider: 'spawn', delivery: 'caller', … })`；spawn provider 的 `inheritsParentContext === false`，子代理是全新 session；`delivery: 'caller'` 让结果只交给本命令，不向父会话追加任何通告 |
+| 联网检索、不跑本地命令 | 人格与可见工具由插件注册的内部 preset 决定（`request.agentPreset = 'dsh-temp-chat'`：persona 行 + 按需挂载的 web/fs/search 工具行 + 压缩组）；组合里没有 `subagent` 行，`maxDepth: 1` 也只放行这一层直接子代理 |
 | 多轮续聊 | 从当前会话日志重放"当前话题"的问答到提示词里（`/single-turn` 是话题边界，也是重置手段） |
 | 回答格式自由 | 提示词（`lib/thread.js` 的 `PROMPT_PREAMBLE`）不规定结构，由子代理按提问自己决定怎么组织；唯一保留的硬要求是引用网页时用 Markdown 链接标注、并在末尾以「来源」列出链接 |
 
@@ -93,7 +100,7 @@ dsh plugin --profile web add github:agi321/dsh-temp-chat
 
 | 文件 | 作用 |
 | --- | --- |
-| `index.js` | 宿主半边：注册两个命令名，起子代理、收答案、释放资源 |
+| `index.js` | 宿主半边：注册两个命令名与内部 preset，`startActivation` 起子代理、收答案、释放资源 |
 | `lib/thread.js` | 纯逻辑：命令名→模式、日志→话题轮次、历史裁剪、提示词拼装 |
 | `client.js` | 客户端半边：命令行渲染成提问 + 回答；用标记节点让正文区在新会话里也能渲染，失败则退回补位面板（模块加载器格式，无构建步骤） |
 | `cordis.patch.yml` | 只插入一行 `id: dsh-temp-chat` |
@@ -109,7 +116,8 @@ dsh plugin --profile web add github:agi321/dsh-temp-chat
   name: '@agi321/dsh-temp-chat'
   config:
     provider: spawn           # 子代理 provider；不要用 fork（会继承上下文）
-    allowTools: [web_search, web_fetch, read, glob, grep]
+    persona: 你是一次性联网检索助手。……   # 可选，覆盖内置检索人格
+    allowTools: [web_search, web_fetch, read, glob, grep]   # 映射为 preset 工具行开关；glob/grep 拆不开，未知工具名忽略并告警
     maxTurns: 12              # 多轮续聊最多重放多少轮
     maxHistoryChars: 24000    # 重放历史的总字符预算
     timeoutMs: 180000         # 单次问答超时
@@ -133,7 +141,8 @@ localStorage.setItem('dsh-temp-chat:transcript-marker', 'on');
 - 答案只进对话、不进主上下文，因此**主 agent 看不到这些答案**；想让它知道，请把要点贴进正常提问。
 - `/multi-turn` 只认最近一次 `/single-turn` 之后的那段话题；想开新话题就直接用 `/single-turn`。
 - 每次临时问答都会留下一个子会话日志（和内置 `subagent` 工具的行为一致）；子代理列表里这一层显示为 `temp-chat:单轮` / `temp-chat:续问`。
-- 子代理用的是当前会话的模型与 preset。
+- 子代理用的是当前会话的模型，但人格与工具组合是插件自己的内部 preset（`dsh-temp-chat`），不是会话 preset。
+  该 preset 会出现在 preset 管理列表里（注册表不区分内部/用户），不建议手动选给普通会话。
 - 正文渲染与标记节点依赖 DSH 的扩展点（`conversation.chat.commandview`、`uiConversation.events.register`、`conversation.chat.node`），DSH 升级后可能变化；变化的表现是退回补位面板或 DSH 内置的命令卡片，不会白屏。
 
 ## 开发
