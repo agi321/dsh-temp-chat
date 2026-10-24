@@ -1,6 +1,6 @@
 {
   "name": "@agi321/dsh-temp-chat",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "description": "Temporary Q&A: /single-turn and /multi-turn answer via an isolated web-researching subagent; results stay in the conversation and never enter the main model context.",
   "license": "MIT",
