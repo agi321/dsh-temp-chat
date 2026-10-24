@@ -2,5 +2,48 @@
   "meta": {
     "title": "临时问答（Temp Chat）",
     "description": "用 /single-turn 单轮提问、用 /multi-turn 续接同一个临时话题。答案由独立子代理联网检索后给出，显示在当前对话里，且永不进入主模型上下文。"
+  },
+  "ui": {
+    "palette": {
+      "singleTurn": {
+        "hint": "要检索的问题",
+        "description": "单轮临时提问：全新子代理联网检索作答，不带先前上下文，答案不进入主模型上下文"
+      },
+      "multiTurn": {
+        "hint": "接着问的问题",
+        "description": "续接上一个临时话题提问：重放 /single-turn 以来的问答再作答，答案同样不进入主模型上下文"
+      }
+    },
+    "command": {
+      "empty": "请输入要问的内容，例如：/{command} 今天有什么新闻？",
+      "tooLong": "提问过长（最多 {max} 字）。",
+      "cancelled": "已取消。",
+      "failed": "临时问答失败：{message}"
+    },
+    "answer": {
+      "noAgent": "命令没有携带 agent，无法定位当前会话。",
+      "noRegistry": "宿主没有 agentPresets 服务：DSH 运行时过旧，或当前组合未包含 preset 注册表。",
+      "providerMissing": "子代理 provider「{provider}」未注册。当前可用：{available}",
+      "listSeparator": "、",
+      "noneAvailable": "（无）",
+      "providerNoPreset": "provider「{provider}」不支持 agentPreset 组合，无法套用临时问答的角色与工具范围；请把 provider 配成 spawn。",
+      "startTimeout": "超时（{seconds}s）未能启动子代理。",
+      "runTimeout": "超时（{seconds}s）已取消，可重试或把问题拆小。",
+      "aborted": "已取消。",
+      "notFinished": "子代理未正常结束（{stopReason}）。",
+      "partialLabel": "（已产出的部分内容）",
+      "noText": "子代理没有返回文本答案。",
+      "noThread": "> 提示：当前没有可续接的临时话题，已按新话题作答。",
+      "truncated": "…（回答过长，已截断）",
+      "unknownError": "未知错误"
+    },
+    "labels": {
+      "singleTurn": "temp-chat:单轮",
+      "multiTurn": "temp-chat:续问"
+    },
+    "preset": {
+      "name": "临时问答（插件内部）",
+      "description": "dsh-temp-chat 子代理专用组合，不建议给普通会话手动选择"
+    }
   }
 }

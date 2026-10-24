@@ -2,7 +2,7 @@
   "name": "@agi321/dsh-temp-chat",
   "version": "0.2.0",
   "type": "module",
-  "description": "临时问答：/single-turn 与 /multi-turn 用独立子代理联网检索作答，结果只留在当前对话，不进入主模型上下文。",
+  "description": "Temporary Q&A: /single-turn and /multi-turn answer via an isolated web-researching subagent; results stay in the conversation and never enter the main model context.",
   "license": "MIT",
   "author": {
     "name": "agi321.cc",
@@ -42,6 +42,7 @@
     "icon.svg",
     "cordis.patch.yml",
     "README.md",
+    "README.zh-CN.md",
     "LICENSE"
   ],
   "icon": "./icon.svg",

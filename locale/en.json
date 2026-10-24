@@ -2,5 +2,48 @@
   "meta": {
     "title": "Temp Chat (temporary questions)",
     "description": "Ask /single-turn for a one-shot answer and /multi-turn to continue the same temporary thread. Answers come from an isolated subagent with web search, are shown in this conversation, and never enter the main model context."
+  },
+  "ui": {
+    "palette": {
+      "singleTurn": {
+        "hint": "question to research",
+        "description": "Single-turn temp question: a fresh subagent researches the web and answers; no prior context, and the answer never enters the main model context"
+      },
+      "multiTurn": {
+        "hint": "follow-up question",
+        "description": "Continue the last temp topic: replays the Q&A since /single-turn and answers again; the answer also stays out of the main model context"
+      }
+    },
+    "command": {
+      "empty": "Type your question, e.g. /{command} what's in the news today?",
+      "tooLong": "Question too long (max {max} characters).",
+      "cancelled": "Cancelled.",
+      "failed": "Temp Q&A failed: {message}"
+    },
+    "answer": {
+      "noAgent": "The command did not carry an agent; cannot locate the current session.",
+      "noRegistry": "The host has no agentPresets service: the DSH runtime is too old, or the current composition lacks a preset registry.",
+      "providerMissing": "Subagent provider \"{provider}\" is not registered. Available: {available}",
+      "listSeparator": ", ",
+      "noneAvailable": "(none)",
+      "providerNoPreset": "Provider \"{provider}\" does not support agentPreset composition, so the temp-chat persona and tool scope cannot be applied; set the provider to spawn.",
+      "startTimeout": "Timed out ({seconds}s) before the subagent could start.",
+      "runTimeout": "Timed out ({seconds}s) and was cancelled. Retry, or split the question into smaller ones.",
+      "aborted": "Cancelled.",
+      "notFinished": "The subagent did not finish normally ({stopReason}).",
+      "partialLabel": "(partial output produced so far)",
+      "noText": "The subagent returned no text answer.",
+      "noThread": "> Note: there is no temp topic to continue, so this was answered as a new topic.",
+      "truncated": "… (answer too long, truncated)",
+      "unknownError": "unknown error"
+    },
+    "labels": {
+      "singleTurn": "temp-chat:single-turn",
+      "multiTurn": "temp-chat:follow-up"
+    },
+    "preset": {
+      "name": "Temp Q&A (plugin internal)",
+      "description": "Preset composed for dsh-temp-chat subagents; not meant for manual selection in regular sessions"
+    }
   }
 }

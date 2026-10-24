@@ -22,8 +22,15 @@
  * 的 web/fs/search 工具行、基础压缩），每次问答以 id 引用它，delivery 用 'caller'
  * （调用方直接 await 结果，不向父会话发完成通告）。
  *
+ * UI 文案的双语支持：宿主能看到的全部用户文案取自 locale/{zh,en}.json 的 `ui`
+ * 段（命令面板在挂载时按静态语言注册；问答期间的提示与报错按提问语言自动跟随，
+ * 含汉字按中文、否则按英文；可用 config 的 language: zh|en 强制）。
+ * 客户端半边的界面词在 client.js 里自带 zh/en 词条，不依赖这里。
+ *
  * @module @agi321/dsh-temp-chat
  */
+import { readFileSync } from 'node:fs';
+
 import {
   MAX_QUESTION_CHARS,
   MULTI_TURN,
@@ -52,26 +59,58 @@ export const DEFAULT_CONFIG = Object.freeze({
   timeoutMs: 180000,
   /** 答案文本上限，超出即截断，保护会话日志。 */
   maxAnswerChars: 60000,
+  /** UI 文案语言：auto = 面板按中文、问答提示跟随提问语言；zh / en = 全程强制。 */
+  language: 'auto',
 });
+
+/** language 的合法取值。 */
+const LANGUAGES = Object.freeze(['auto', 'zh', 'en']);
+
+/**
+ * 宿主可见文案：locale/{zh,en}.json 的 `ui` 段，挂载时一次性读入。
+ * 文件缺失或缺 `ui` 段直接抛错——宁可启动失败，也不要半套文案。
+ */
+function loadUi(lang) {
+  const url = new URL(`./locale/${lang}.json`, import.meta.url);
+  const doc = JSON.parse(readFileSync(url, 'utf8'));
+  if (doc === null || typeof doc !== 'object' || doc.ui === undefined) {
+    throw new Error(`dsh-temp-chat: locale/${lang}.json 缺少 "ui" 段`);
+  }
+  return doc.ui;
+}
+
+const UI = Object.freeze({ zh: loadUi('zh'), en: loadUi('en') });
+
+/** 含汉字即视为中文提问（日文汉字混排也归中文文案，插件主要面向中英）。 */
+const HAN = /\p{Script=Han}/u;
+
+/** 挂载期的静态文案：面板、preset 名等只注册一次，无法逐条跟随提问语言。 */
+function staticUi(settings) {
+  return UI[settings.language === 'en' ? 'en' : 'zh'];
+}
+
+/** 问答期文案：显式 zh/en 直接采用；auto 按提问语言自动跟随。 */
+function runUi(settings, question) {
+  if (settings.language === 'zh' || settings.language === 'en') return UI[settings.language];
+  return HAN.test(String(question ?? '')) ? UI.zh : UI.en;
+}
+
+/** `{name}` 占位符插值；params 没有对应键时原样保留。 */
+function fmt(template, params) {
+  return template.replace(/\{(\w+)\}/gu, (whole, key) => (
+    params !== undefined && Object.hasOwn(params, key) ? String(params[key]) : whole
+  ));
+}
 
 /**
  * 要注册的命令表。
  *
- * `mode` 是命令对应的规范模式（单轮 / 多轮），命令名只用于注册与回显。
+ * `mode` 是命令对应的规范模式（单轮 / 多轮），命令名只用于注册与回显；
+ * 面板文案（hint/description）在 apply() 挂载时按静态语言从 ui.palette 取。
  */
 const COMMANDS = Object.freeze([
-  {
-    name: SINGLE_TURN,
-    mode: SINGLE_TURN,
-    hint: '要检索的问题',
-    description: '单轮临时提问：全新子代理联网检索作答，不带先前上下文，答案不进入主模型上下文',
-  },
-  {
-    name: MULTI_TURN,
-    mode: MULTI_TURN,
-    hint: '接着问的问题',
-    description: '续接上一个临时话题提问：重放 /single-turn 以来的问答再作答，答案同样不进入主模型上下文',
-  },
+  { name: SINGLE_TURN, mode: SINGLE_TURN, paletteKey: 'singleTurn' },
+  { name: MULTI_TURN, mode: MULTI_TURN, paletteKey: 'multiTurn' },
 ]);
 
 const PERSONA = [
@@ -105,9 +144,10 @@ const MAPPABLE_TOOLS = Object.freeze([
  * 有意不挂 agent-instructions / skill / todo 等行：旧白名单本就把它们遮掉了。
  *
  * @param {ResolvedConfig} settings - 已解析配置。
+ * @param {any} ui - 挂载期的静态文案（preset 名与描述随面板语言注册一次）。
  * @returns {any} PresetDefinition（@deepseek-ai/dsh-agent-preset-registry）。
  */
-function buildPresetDefinition(settings) {
+function buildPresetDefinition(settings, ui) {
   const want = new Set(settings.allowTools);
   const plugins = [
     { id: 'persona', name: '@deepseek-ai/dsh-persona', config: { prefix: settings.persona } },
@@ -160,8 +200,8 @@ function buildPresetDefinition(settings) {
 
   return {
     id: PRESET_ID,
-    name: '临时问答（插件内部）',
-    description: 'dsh-temp-chat 子代理专用组合，不建议给普通会话手动选择',
+    name: ui.preset.name,
+    description: ui.preset.description,
     plugins,
   };
 }
@@ -172,18 +212,19 @@ function buildPresetDefinition(settings) {
  * @param {any} ctx - 上下文。
  * @param {ResolvedConfig} settings - 已解析配置。
  * @param {{ promise: Promise<(() => Promise<void>) | null> | null }} state - 每次 apply 的注册记忆。
+ * @param {any} ui - 静态文案（preset 名与 noRegistry 报错）。
  * @returns {Promise<() => Promise<void>>} 解析为注销函数；注册失败会清空记忆以便下次命令重试。
  */
-function ensurePreset(ctx, settings, state) {
+function ensurePreset(ctx, settings, state, ui) {
   if (state.promise === null) {
     const registry = ctx.get('agentPresets');
     if (registry === undefined || typeof registry.register !== 'function') {
       // 不落记忆：agentPresets 可能只是还没就绪，下一条命令再试。
-      return Promise.reject(new Error('宿主没有 agentPresets 服务：DSH 运行时过旧，或当前组合未包含 preset 注册表。'));
+      return Promise.reject(new Error(ui.answer.noRegistry));
     }
     let attempt;
     try {
-      attempt = registry.register(buildPresetDefinition(settings));
+      attempt = registry.register(buildPresetDefinition(settings, ui));
     } catch (error) {
       return Promise.reject(error);
     }
@@ -212,6 +253,8 @@ function ensurePreset(ctx, settings, state) {
  */
 export function apply(ctx, config) {
   const settings = resolveConfig(config);
+  /** 挂载期文案：面板与 preset 只能注册一次，取静态语言（auto = 中文）。 */
+  const palette = staticUi(settings);
   /** 本 apply 周期的 preset 注册状态（null = 尚未注册或注册失败待重试）。 */
   const presetState = { promise: null };
 
@@ -224,7 +267,7 @@ export function apply(ctx, config) {
   // 预热注册：agentPresets 就绪时尽早挂载，让挂载问题在日志里提前可见；
   // 失败不致命，命令路径会重试并把错误报给用户。
   ctx.effect(() => {
-    ensurePreset(ctx, settings, presetState).then(
+    ensurePreset(ctx, settings, presetState, palette).then(
       (unregister) => { presetState.dispose = unregister; },
       (error) => { ctx.logger?.warn?.(`dsh-temp-chat: preset 预热注册失败：${messageOf(error)}`); },
     );
@@ -235,10 +278,11 @@ export function apply(ctx, config) {
   });
 
   for (const command of COMMANDS) {
+    const meta = palette.palette[command.paletteKey];
     ctx.effect(() => ctx.commands.register({
       name: command.name,
-      description: command.description,
-      input: { hint: command.hint },
+      description: meta.description,
+      input: { hint: meta.hint },
       // 方案 B：长任务命令（子代理联网问答可达数分钟）。宿主打了 async 补丁时，
       // commands/execute 在受理后立即返回，输入框草稿即时清空、Enter 不再被冻结；
       // 真实答案稍后经 command/done 落到对话行（commandview 渲染逻辑不变）。
@@ -273,16 +317,24 @@ export function apply(ctx, config) {
 async function handleCommand(ctx, settings, state, command, invocation) {
   const normalized = normalizeQuestion(invocation.rawInput);
   if (!normalized.ok) {
-    return normalized.reason === 'empty'
-      ? { kind: 'error', text: `请输入要问的内容，例如：/${command.name} 今天有什么新闻？` }
-      : { kind: 'error', text: `提问过长（最多 ${MAX_QUESTION_CHARS} 字）。` };
+    if (normalized.reason === 'empty') {
+      // 空输入没有语言可依，跟随面板的静态语言。
+      const palette = staticUi(settings);
+      return { kind: 'error', text: fmt(palette.command.empty, { command: command.name }) };
+    }
+    // 超长的整段文本本身就是提问，可以按它检测语言。
+    const ui = runUi(settings, invocation.rawInput);
+    return { kind: 'error', text: fmt(ui.command.tooLong, { max: MAX_QUESTION_CHARS }) };
   }
 
+  // 问答期文案跟随提问语言（language: auto），或按配置强制 zh / en。
+  const ui = runUi(settings, normalized.question);
   try {
-    return { kind: 'success', text: await answer(ctx, settings, state, command.mode, normalized.question, invocation) };
+    const text = await answer(ctx, settings, state, command.mode, normalized.question, invocation, ui);
+    return { kind: 'success', text };
   } catch (error) {
-    if (invocation.signal?.aborted) return { kind: 'error', text: '已取消。' };
-    return { kind: 'error', text: `临时问答失败：${messageOf(error)}` };
+    if (invocation.signal?.aborted) return { kind: 'error', text: ui.command.cancelled };
+    return { kind: 'error', text: fmt(ui.command.failed, { message: messageOf(error, ui) }) };
   }
 }
 
@@ -295,22 +347,26 @@ async function handleCommand(ctx, settings, state, command, invocation) {
  * @param {string} mode - 规范模式（single-turn / multi-turn）。
  * @param {string} question - 已校验的提问。
  * @param {any} invocation - 命令调用。
+ * @param {any} ui - 本轮问答采用的文案（跟随提问语言）。
  * @returns {Promise<string>} 展示给用户的答案文本。
  */
-async function answer(ctx, settings, state, mode, question, invocation) {
+async function answer(ctx, settings, state, mode, question, invocation, ui) {
   const agent = invocation.agent;
-  if (agent === undefined) throw new Error('命令没有携带 agent，无法定位当前会话。');
+  if (agent === undefined) throw new Error(ui.answer.noAgent);
 
   const provider = ctx.subagents.getProvider(settings.provider);
   if (provider === undefined) {
     const available = ctx.subagents.list();
-    throw new Error(`子代理 provider「${settings.provider}」未注册。当前可用：${available.length > 0 ? available.join('、') : '（无）'}`);
+    throw new Error(fmt(ui.answer.providerMissing, {
+      provider: settings.provider,
+      available: available.length > 0 ? available.join(ui.answer.listSeparator) : ui.answer.noneAvailable,
+    }));
   }
   if (provider.capabilities !== undefined && provider.capabilities.agentPreset !== true) {
-    throw new Error(`provider「${settings.provider}」不支持 agentPreset 组合，无法套用临时问答的角色与工具范围；请把 provider 配成 spawn。`);
+    throw new Error(fmt(ui.answer.providerNoPreset, { provider: settings.provider }));
   }
 
-  await ensurePreset(ctx, settings, state);
+  await ensurePreset(ctx, settings, state, staticUi(settings));
 
   let history = [];
   let missingThread = false;
@@ -326,7 +382,7 @@ async function answer(ctx, settings, state, mode, question, invocation) {
   try {
     activation = await ctx.subagents.startActivation({
       provider: settings.provider,
-      label: mode === MULTI_TURN ? 'temp-chat:续问' : 'temp-chat:单轮',
+      label: mode === MULTI_TURN ? ui.labels.multiTurn : ui.labels.singleTurn,
       request: {
         parent: agent,
         prompt: [{ type: 'text', text: prompt }],
@@ -342,7 +398,7 @@ async function answer(ctx, settings, state, mode, question, invocation) {
     });
   } catch (error) {
     guard.dispose();
-    if (guard.timedOut()) throw new Error(`超时（${Math.round(settings.timeoutMs / 1000)}s）未能启动子代理。`);
+    if (guard.timedOut()) throw new Error(fmt(ui.answer.startTimeout, { seconds: Math.round(settings.timeoutMs / 1000) }));
     throw error;
   }
 
@@ -350,7 +406,7 @@ async function answer(ctx, settings, state, mode, question, invocation) {
   try {
     result = await activation.result;
   } catch (error) {
-    if (guard.timedOut()) throw new Error(`超时（${Math.round(settings.timeoutMs / 1000)}s）已取消，可重试或把问题拆小。`);
+    if (guard.timedOut()) throw new Error(fmt(ui.answer.runTimeout, { seconds: Math.round(settings.timeoutMs / 1000) }));
     throw error;
   } finally {
     guard.dispose();
@@ -362,19 +418,19 @@ async function answer(ctx, settings, state, mode, question, invocation) {
   }
 
   const text = outputText(result);
-  if (result.stopReason === 'aborted') throw new Error('已取消。');
+  if (result.stopReason === 'aborted') throw new Error(ui.answer.aborted);
   if (result.stopReason !== 'completed') {
-    const detail = text.length > 0 ? `\n\n（已产出的部分内容）\n\n${text}` : '';
-    throw new Error(`子代理未正常结束（${String(result.stopReason)}）。${detail}`);
+    const detail = text.length > 0 ? `\n\n${ui.answer.partialLabel}\n\n${text}` : '';
+    throw new Error(fmt(ui.answer.notFinished, { stopReason: String(result.stopReason) }) + detail);
   }
-  if (text.length === 0) throw new Error('子代理没有返回文本答案。');
+  if (text.length === 0) throw new Error(ui.answer.noText);
 
   // 只把模型的回答交给对话：工具调用、检索词、来源链接等过程信息一律不显示，
   // 用户在时间线里看到的就是答案本身（`command/done` 是 log-only，不进模型上下文）。
-  const answer = clip(text, settings.maxAnswerChars);
+  const answerText = clip(text, settings.maxAnswerChars, ui);
   return missingThread
-    ? `> 提示：当前没有可续接的临时话题，已按新话题作答。\n\n${answer}`
-    : answer;
+    ? `${ui.answer.noThread}\n\n${answerText}`
+    : answerText;
 }
 
 /* ------------------------------------------------------------------ *
@@ -434,6 +490,7 @@ function resolveConfig(config) {
     maxHistoryChars: countOf(source.maxHistoryChars, DEFAULT_CONFIG.maxHistoryChars),
     timeoutMs: countOf(source.timeoutMs, DEFAULT_CONFIG.timeoutMs),
     maxAnswerChars: countOf(source.maxAnswerChars, DEFAULT_CONFIG.maxAnswerChars),
+    language: LANGUAGES.includes(source.language) ? source.language : DEFAULT_CONFIG.language,
   };
 }
 
@@ -483,8 +540,8 @@ function outputText(result) {
 }
 
 /** 超长文本截断并标注。 */
-function clip(value, maxChars) {
-  return value.length <= maxChars ? value : `${value.slice(0, maxChars)}\n\n…（回答过长，已截断）`;
+function clip(value, maxChars, ui) {
+  return value.length <= maxChars ? value : `${value.slice(0, maxChars)}\n\n${ui.answer.truncated}`;
 }
 
 /** 非空字符串取值。 */
@@ -497,13 +554,13 @@ function countOf(value, fallback) {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : fallback;
 }
 
-/** 安全地取错误信息。 */
-function messageOf(error) {
+/** 安全地取错误信息（未知错误兜底走文案；日志等非问答路径默认中文）。 */
+function messageOf(error, ui = UI.zh) {
   if (error instanceof Error) return error.message;
   try {
     return String(error);
   } catch {
-    return '未知错误';
+    return ui.answer.unknownError;
   }
 }
 
@@ -516,4 +573,5 @@ function messageOf(error) {
  * @property {number} maxHistoryChars
  * @property {number} timeoutMs
  * @property {number} maxAnswerChars
+ * @property {'auto' | 'zh' | 'en'} language - UI 文案语言（auto = 面板中文、问答提示跟随提问语言）。
  */

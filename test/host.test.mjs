@@ -170,6 +170,48 @@ test('every registered command describes itself without mentioning a short alias
   }
 });
 
+test('language: en registers English palette text, preset name and labels', async () => {
+  const { registered, runs, presets, agent } = setup({}, { language: 'en' });
+  assert.match(registered.get(SINGLE_TURN).description, /Single-turn temp question/);
+  assert.match(registered.get(SINGLE_TURN).input.hint, /question to research/i);
+  assert.match(registered.get(MULTI_TURN).description, /Continue the last temp topic/);
+  assert.equal(presets[0].name, 'Temp Q&A (plugin internal)');
+  const result = await invoke(registered.get(SINGLE_TURN).handler, '今天天气如何？', { agent });
+  assert.equal(result.kind, 'success');
+  assert.match(runs[0].label, /single-turn/, '强制 en 后，标签连中文提问也用英文');
+});
+
+test('language: auto makes per-run notices follow the question language', async () => {
+  const options = { providerCaps: { agentPreset: false } };
+  const en = setup(options);
+  const enResult = await invoke(en.registered.get(SINGLE_TURN).handler, 'What is the weather tomorrow?', { agent: en.agent });
+  assert.equal(enResult.kind, 'error');
+  assert.match(enResult.text, /does not support agentPreset/);
+
+  const zh = setup(options);
+  const zhResult = await invoke(zh.registered.get(SINGLE_TURN).handler, '明天天气如何？', { agent: zh.agent });
+  assert.match(zhResult.text, /不支持 agentPreset/);
+
+  const long = setup();
+  const longResult = await invoke(long.registered.get(SINGLE_TURN).handler, 'x'.repeat(9000), { agent: long.agent });
+  assert.match(longResult.text, /Question too long/, '超长提示同样跟随文本语言');
+});
+
+test('an English /multi-turn cold start answers with the English note', async () => {
+  const { registered, runs, agent } = setup({ sessionEvents: [] });
+  const result = await invoke(registered.get(MULTI_TURN).handler, 'any topic to continue?', { agent });
+  assert.equal(result.kind, 'success');
+  assert.match(result.text, /^> Note: there is no temp topic to continue/);
+  assert.match(runs[0].label, /temp-chat:follow-up/);
+});
+
+test('the no-provider error lists the available providers in the question language', async () => {
+  const { registered, agent } = setup({ providerName: 'spawn' }, { provider: 'fork' });
+  const en = await invoke(registered.get(SINGLE_TURN).handler, 'which provider is used?', { agent });
+  assert.match(en.text, /provider "fork" is not registered/);
+  assert.match(en.text, /Available: spawn/);
+});
+
 test('/single-turn runs one activation against the internal preset with an isolated prompt', async () => {
   const { registered, runs, presets, agent } = setup();
   const result = await invoke(registered.get(SINGLE_TURN).handler, '  今天天气如何？  ', { agent });
@@ -343,7 +385,7 @@ test('empty and over-long questions are rejected before any child starts', async
   assert.match(empty.text, /请输入要问的内容/);
   assert.match(empty.text, /\/single-turn 今天有什么新闻？/, '示例回显用户实际敲的命令名');
 
-  const tooLong = await invoke(handler, 'x'.repeat(9000), { agent });
+  const tooLong = await invoke(handler, '问'.repeat(9000), { agent });
   assert.equal(tooLong.kind, 'error');
   assert.match(tooLong.text, /提问过长/);
 
